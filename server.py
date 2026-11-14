@@ -22,8 +22,8 @@ def home():
     return {"status": "SmartBuddy YouTube Music MCP Server is Running!"}
 
 
-@app.get("/stream")
-def stream_music(q: str = Query(..., description="Song name in Bangla, Hindi, or English")):
+@app.get("/pcm")
+def stream_pcm(q: str = Query(..., description="Song name"), rate: int = 24000):
     cmd_url = [
         "yt-dlp",
         "-f", "bestaudio",
@@ -31,10 +31,11 @@ def stream_music(q: str = Query(..., description="Song name in Bangla, Hindi, or
         f"ytsearch1:{q} audio"
     ]
     try:
-        audio_url = subprocess.check_output(cmd_url, text=True).strip().split('\n')[0]
+        audio_url = subprocess.check_output(cmd_url, text=True, timeout=15).strip().split('\n')[0]
     except Exception as e:
         return {"error": str(e)}
 
+    # সরাসরি 16-bit Mono PCM অডিও আউটপুট (ESP32 I2S স্পিকারে সরাসরি বাজানোর জন্য)
     ffmpeg_cmd = [
         "ffmpeg",
         "-reconnect", "1",
@@ -42,11 +43,10 @@ def stream_music(q: str = Query(..., description="Song name in Bangla, Hindi, or
         "-reconnect_delay_max", "5",
         "-i", audio_url,
         "-vn",
-        "-acodec", "libmp3lame",
+        "-acodec", "pcm_s16le",
         "-ac", "1",
-        "-ar", "24000",
-        "-b:a", "64k",
-        "-f", "mp3",
+        "-ar", str(rate),
+        "-f", "s16le",
         "pipe:1"
     ]
 
@@ -62,7 +62,7 @@ def stream_music(q: str = Query(..., description="Song name in Bangla, Hindi, or
         finally:
             process.kill()
 
-    return StreamingResponse(generate(), media_type="audio/mpeg")
+    return StreamingResponse(generate(), media_type="application/octet-stream")
 
 
 def search_youtube_info(query: str):
@@ -80,12 +80,17 @@ def search_youtube_info(query: str):
 async def mcp_bridge_loop():
     while True:
         try:
-            async with websockets.connect(MCP_ENDPOINT, ping_interval=20, ping_timeout=20) as ws:
-                print("Connected to Xiaozhi MCP Server!")
+            # ping_interval=None দিলে অযথা রিকানেক্ট লুপ হবে না
+            async with websockets.connect(MCP_ENDPOINT, ping_interval=None, close_timeout=10) as ws:
+                print("Connected to Xiaozhi MCP Server stably!")
                 async for message in ws:
                     data = json.loads(message)
                     msg_id = data.get("id")
                     method = data.get("method")
+
+                    if msg_id is None:
+                        # Notifications (যেমন notifications/initialized) ইগনোর করা হবে
+                        continue
 
                     if method == "initialize":
                         resp = {
@@ -106,15 +111,12 @@ async def mcp_bridge_loop():
                             "result": {
                                 "tools": [
                                     {
-                                        "name": "play_youtube_song",
-                                        "description": "Search and play ANY song from YouTube in Bangla, Hindi, or English. Always use this tool when the user asks to play a song or music.",
+                                        "name": "search_youtube_song",
+                                        "description": "Search any song on YouTube (Bangla, Hindi, English) and get its stream query.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "song_name": {
-                                                    "type": "string",
-                                                    "description": "The exact name of the song and artist (in Bangla, Hindi, or English)"
-                                                }
+                                                "song_name": {"type": "string"}
                                             },
                                             "required": ["song_name"]
                                         }
@@ -126,31 +128,23 @@ async def mcp_bridge_loop():
 
                     elif method == "tools/call":
                         params = data.get("params", {})
-                        tool_name = params.get("name")
                         args = params.get("arguments", {})
+                        song_name = args.get("song_name", "")
+                        try:
+                            title, artist = await asyncio.to_thread(search_youtube_info, song_name)
+                            result_text = f"Found '{title}' by {artist}. Now call self.music.play_youtube with query='{song_name}' to play it on the ESP32 speaker!"
+                        except Exception as e:
+                            result_text = f"Search error: {str(e)}"
 
-                        if tool_name == "play_youtube_song":
-                            song_name = args.get("song_name", "")
-                            try:
-                                title, artist = await asyncio.to_thread(search_youtube_info, song_name)
-                                encoded_q = urllib.parse.quote(song_name)
-                                stream_url = f"{RENDER_BASE_URL}/stream?q={encoded_q}"
-                                result_text = (
-                                    f"Found on YouTube: '{title}' by {artist}. "
-                                    f"Stream URL: {stream_url} — Play this audio stream on the device now."
-                                )
-                            except Exception as e:
-                                result_text = f"Could not fetch '{song_name}' from YouTube: {str(e)}"
-
-                            resp = {
-                                "jsonrpc": "2.0",
-                                "id": msg_id,
-                                "result": {
-                                    "content": [{"type": "text", "text": result_text}],
-                                    "isError": False
-                                }
+                        resp = {
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "result": {
+                                "content": [{"type": "text", "text": result_text}],
+                                "isError": False
                             }
-                            await ws.send(json.dumps(resp))
+                        }
+                        await ws.send(json.dumps(resp))
         except Exception as e:
             print(f"MCP reconnecting in 5s due to: {e}")
             await asyncio.sleep(5)
